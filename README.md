@@ -4,7 +4,7 @@
 
 Spindle lets you manage a Linux system the way you'd explain it to a friend. Ask it to check your disks, install a package, find what's eating your CPU, or fix a broken repo — Spindle figures out the right command, runs it safely, and explains the result like you've never touched a terminal before.
 
-Built on Claude, developed by [Petacomm](https://github.com/petacomm).
+Developed by [Petacomm](https://github.com/petacomm).
 
 ---
 
