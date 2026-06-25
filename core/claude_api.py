@@ -1,656 +1,585 @@
-#!/usr/bin/env python3
 """
-Spindle - Linux Management Tool
-Usage:
-    spindle status                    -> System status
-    spindle health                    -> Health score
-    spindle ls services               -> List services
-    spindle config --model modelname (ex: spindle config --model opus) -> Configure LLM model
-    spindle ls ports                  -> Open ports
-    spindle ls backups                -> List backups
-    spindle ls processes              -> List processes
-    spindle -r "your request"         -> Ask AI
-    spindle find "keyword"            -> Find and delete files
-    spindle backup now                -> Take backup now
-    spindle restore <name>            -> Restore backup
-    spindle login                     -> Set API key
+Spindle - Claude API Integration
+With conversation memory + parallel execution + model selection.
 """
 
-import sys
+import json
 import os
 import re
-import getpass
+import subprocess
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
 
-from core import scanner, executor, claude_api, backup
-from rich.console import Console
-from rich.table import Table
-from rich.panel import Panel
-from rich.prompt import Prompt, Confirm
-from rich import box
-from rich.columns import Columns
-from rich.progress import Progress, SpinnerColumn, TextColumn
+CONFIG_PATH = Path.home() / ".spindle" / "config.json"
+HISTORY_PATH = Path.home() / ".spindle" / "history.json"
+MAX_HISTORY = 6
 
-console = Console()
-
-
-def print_response_panel(text, title=""):
-    """Show response in a panel if terminal is wide enough, otherwise plain text."""
-    width = console.size.width
-    if width < 90:
-        if title:
-            console.print(f"[cyan bold]{title}[/]")
-            console.print()
-        console.print(text)
-    else:
-        console.print(Panel(
-            text,
-            title=f"[cyan]{title}[/]" if title else None,
-            border_style="cyan",
-            padding=(1, 2),
-            width=min(width - 4, 120),
-        ))
+MODELS = {
+    "sonnet": {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5"},
+    "opus":   {"id": "claude-opus-4-6",   "name": "Claude Opus 4.6"},
+    "haiku":  {"id": "claude-haiku-4-5-20251001",  "name": "Claude Haiku 4.5"},
+}
+DEFAULT_MODEL = "sonnet"
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def risk_color(level: str) -> str:
-    return {"green": "bright_green", "yellow": "yellow", "red": "red"}.get(level, "white")
-
-def pct_color(pct: float) -> str:
-    if pct >= 90: return "red"
-    if pct >= 75: return "yellow"
-    return "bright_green"
-
-def bar(pct: float, width: int = 20) -> str:
-    filled = int(pct / 100 * width)
-    color = pct_color(pct)
-    bar_str = "█" * filled + "░" * (width - filled)
-    return f"[{color}]{bar_str}[/] [dim]{pct:.1f}%[/]"
-
-def status_icon(active: bool, status: str = "") -> str:
-    if status == "failed": return "[red]✗[/]"
-    if active: return "[bright_green]●[/]"
-    return "[dim]○[/]"
+def load_config():
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
 
 
-# ─── Commands ─────────────────────────────────────────────────────────────────
+def save_config(data):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
-def cmd_status():
-    with Progress(SpinnerColumn(), TextColumn("[cyan]Scanning system..."), transient=True) as p:
-        p.add_task("")
-        data = scanner.full_scan()
 
-    h = data["health"]
-    score_color = {"good": "bright_green", "warning": "yellow", "critical": "red"}.get(h["level"], "white")
+def get_api_key():
+    config = load_config()
+    return config.get("api_key") or os.environ.get("ANTHROPIC_API_KEY")
 
-    console.print()
-    console.print(Panel(
-        f"[bold cyan]Spindle[/] — Linux Management Tool\n"
-        f"[dim]{data['scanned_at']}[/]",
-        border_style="cyan", padding=(0, 2)
-    ))
 
-    info = Table(box=None, show_header=False, padding=(0, 2))
-    info.add_column(style="dim", width=16)
-    info.add_column()
-    info.add_row("Hostname", f"[bold]{data['hostname']}[/]")
-    info.add_row("IP", data["ip"])
-    info.add_row("OS", data["os"])
-    info.add_row("Kernel", data["kernel"])
-    info.add_row("Uptime", data["uptime"])
-    load = data.get("load", ["-", "-", "-"])
-    info.add_row("Load Avg", f"{' '.join(load)}")
+def set_api_key(key):
+    config = load_config()
+    config["api_key"] = key
+    save_config(config)
 
-    score_panel = Panel(
-        f"\n[{score_color} bold]{h['score']}[/][dim]/100[/]\n\n[{score_color}]{h['level'].upper()}[/]\n",
-        title="Health Score", border_style=score_color, width=20
+
+def get_model():
+    config = load_config()
+    model_key = config.get("model", DEFAULT_MODEL)
+    return MODELS.get(model_key, MODELS[DEFAULT_MODEL])
+
+
+def set_model(model_key):
+    if model_key not in MODELS:
+        return False
+    config = load_config()
+    config["model"] = model_key
+    save_config(config)
+    return True
+
+
+def get_model_display_name():
+    return get_model()["name"]
+
+
+# ─── Conversation memory ──────────────────────────────────────────────────────
+
+def load_history():
+    if HISTORY_PATH.exists():
+        try:
+            data = json.loads(HISTORY_PATH.read_text())
+            cutoff = time.time() - 2 * 3600
+            data = [h for h in data if h.get("ts", 0) > cutoff]
+            return data[-MAX_HISTORY:]
+        except Exception:
+            return []
+    return []
+
+
+def save_history_turn(request, response, command_ran=None, command_output=None):
+    history = []
+    if HISTORY_PATH.exists():
+        try:
+            history = json.loads(HISTORY_PATH.read_text())
+        except Exception:
+            history = []
+
+    turn = {"ts": time.time(), "request": request, "response": response[:500]}
+    if command_ran:
+        turn["command_ran"] = command_ran
+    if command_output:
+        turn["command_output"] = command_output[:800]
+
+    history.append(turn)
+    history = history[-MAX_HISTORY * 2:]
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_PATH.write_text(json.dumps(history, indent=2, ensure_ascii=False))
+
+
+def clear_history():
+    if HISTORY_PATH.exists():
+        HISTORY_PATH.unlink()
+
+
+def _history_to_messages(history):
+    messages = []
+    for h in history:
+        messages.append({"role": "user", "content": h["request"]})
+        assistant_content = h["response"]
+        if h.get("command_ran"):
+            assistant_content += f"\n[Ran command: {h['command_ran']}]"
+        if h.get("command_output"):
+            assistant_content += f"\n[Output: {h['command_output'][:300]}]"
+        messages.append({"role": "assistant", "content": assistant_content})
+    return messages
+
+
+# ─── Claude API ───────────────────────────────────────────────────────────────
+
+def _call_claude(messages, system, api_key, max_tokens=1024, model_id=None):
+    import urllib.request, urllib.error
+    if model_id is None:
+        model_id = get_model()["id"]
+    payload = json.dumps({
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": messages,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        method="POST",
     )
-
-    console.print(Columns([info, score_panel]))
-
-    console.print()
-    console.print("[bold]Resources[/]")
-    res = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
-    res.add_column(style="dim", width=6)
-    res.add_column(width=30)
-    res.add_column()
-    res.add_row("CPU", bar(data["cpu"]), f"[dim]{data['cpu']:.1f}%[/]")
-    ram = data["ram"]
-    res.add_row("RAM", bar(ram["percent"]),
-                f"[dim]{scanner.fmt_bytes(ram['used'])} / {scanner.fmt_bytes(ram['total'])}[/]")
-    for disk in data["disks"][:3]:
-        res.add_row(disk["mount"][:6], bar(disk["percent"]),
-                    f"[dim]{scanner.fmt_bytes(disk['used'])} / {scanner.fmt_bytes(disk['total'])}[/]")
-    console.print(res)
-
-    if h["criticals"]:
-        console.print()
-        for c in h["criticals"]:
-            console.print(f"  [red]🔴 {c}[/]")
-    if h["warnings"]:
-        for w in h["warnings"]:
-            console.print(f"  [yellow]🟡 {w}[/]")
-
-    active_svcs = [s for s in data["services"] if s["active"]]
-    failed_svcs = [s for s in data["services"] if s["status"] == "failed"]
-    console.print()
-    console.print(
-        f"[dim]Services:[/] "
-        f"[bright_green]{len(active_svcs)} running[/]"
-        + (f"  [red]{len(failed_svcs)} failed[/]" if failed_svcs else "")
-    )
-    console.print()
-
-
-def cmd_health():
-    with Progress(SpinnerColumn(), TextColumn("[cyan]Analyzing..."), transient=True) as p:
-        p.add_task("")
-        data = scanner.full_scan()
-
-    h = data["health"]
-    score_color = {"good": "bright_green", "warning": "yellow", "critical": "red"}.get(h["level"], "white")
-
-    console.print()
-    console.print(Panel(
-        f"[{score_color} bold]Health Score: {h['score']}/100 — {h['level'].upper()}[/]",
-        border_style=score_color
-    ))
-
-    if not h["criticals"] and not h["warnings"]:
-        console.print("[bright_green]✓ System looks healthy, no issues detected.[/]")
-    else:
-        if h["criticals"]:
-            console.print("\n[bold red]Critical Issues:[/]")
-            for c in h["criticals"]:
-                console.print(f"  🔴 {c}")
-        if h["warnings"]:
-            console.print("\n[bold yellow]Warnings:[/]")
-            for w in h["warnings"]:
-                console.print(f"  🟡 {w}")
-    console.print()
-
-
-def cmd_ls(target: str):
-    if target in ("services", "service"):
-        with Progress(SpinnerColumn(), TextColumn("[cyan]Scanning services..."), transient=True) as p:
-            p.add_task("")
-            services = scanner.get_services()
-
-        console.print()
-        t = Table(title="Services", box=box.ROUNDED, border_style="cyan")
-        t.add_column("", width=4)
-        t.add_column("Service", style="bold")
-        t.add_column("Status", width=12)
-        for s in services:
-            t.add_row(
-                status_icon(s["active"], s["status"]),
-                s["name"],
-                f"[bright_green]{s['status']}[/]" if s["active"] else
-                f"[red]{s['status']}[/]" if s["status"] == "failed" else
-                f"[dim]{s['status']}[/]"
-            )
-        console.print(t)
-
-    elif target in ("ports", "port"):
-        with Progress(SpinnerColumn(), TextColumn("[cyan]Scanning ports..."), transient=True) as p:
-            p.add_task("")
-            ports = scanner.get_open_ports()
-
-        console.print()
-        t = Table(title="Open Ports", box=box.ROUNDED, border_style="cyan")
-        t.add_column("Port", style="yellow", width=8)
-        t.add_column("Service")
-        for p in ports:
-            t.add_row(str(p["port"]), p["service"] or "—")
-        console.print(t)
-
-    elif target in ("backups", "backup"):
-        backups = backup.list_backups()
-        console.print()
-        if not backups:
-            console.print("[dim]No backups yet.[/]")
-            return
-        t = Table(title="Backups", box=box.ROUNDED, border_style="cyan")
-        t.add_column("#", width=4, style="dim")
-        t.add_column("Name")
-        t.add_column("Date", style="dim")
-        t.add_column("Files", width=7, justify="right")
-        t.add_column("Size", width=10, justify="right")
-        for i, b in enumerate(backups, 1):
-            t.add_row(str(i), b["name"], b["created_at"], str(b["files"]), b["size"])
-        console.print(t)
-
-    elif target in ("processes", "process", "ps"):
-        with Progress(SpinnerColumn(), TextColumn("[cyan]Getting processes..."), transient=True) as p:
-            p.add_task("")
-            out = executor.run_command("ps aux --sort=-%cpu | head -20")
-
-        console.print()
-        console.print(Panel(out["output"], title="Top 20 Processes", border_style="cyan"))
-
-    else:
-        console.print(f"[yellow]Unknown target: {target}[/]")
-        console.print("[dim]Available: services, ports, backups, processes[/]")
-
-
-def cmd_logs(target: str, follow: bool = False):
-    log_map = {
-        "nginx": "/var/log/nginx/error.log",
-        "apache": "/var/log/apache2/error.log",
-        "mysql": "/var/log/mysql/error.log",
-        "system": "/var/log/syslog",
-        "auth": "/var/log/auth.log",
-        "kern": "/var/log/kern.log",
-    }
-    log_file = log_map.get(target, f"/var/log/{target}.log")
-
-    if follow:
-        console.print(f"[dim]Live log: {log_file} (Ctrl+C to exit)[/]")
-        os.execlp("tail", "tail", "-f", log_file)
-    else:
-        out = executor.run_command(f"tail -50 {log_file}")
-        if out["success"]:
-            console.print(Panel(out["output"], title=f"Log: {log_file}", border_style="cyan"))
-        else:
-            console.print(f"[red]Cannot read log: {log_file}[/]")
-
-
-def cmd_find(query: str):
-    console.print()
-    with Progress(SpinnerColumn(), TextColumn(f"[cyan]Searching '{query}'..."), transient=True) as p:
-        p.add_task("")
-        results = executor.find_files(query)
-
-    if not results:
-        console.print(f"[dim]No files found matching '{query}'.[/]")
-        return
-
-    t = Table(box=box.SIMPLE, show_header=True)
-    t.add_column("#", width=4, style="dim")
-    t.add_column("Type", width=7)
-    t.add_column("Path")
-    t.add_column("Size", width=10, justify="right", style="dim")
-
-    for r in results:
-        icon = "📁" if r["is_dir"] else "📄"
-        t.add_row(str(r["num"]), icon + " " + r["type"], r["path"], r["size_fmt"])
-
-    console.print(t)
-    console.print(f"[dim]{len(results)} results found.[/]")
-    console.print()
-
-    console.print("[dim]Type which to delete (e.g: delete 1,2,3) or Enter to exit:[/]")
-    choice = Prompt.ask("", default="")
-
-    if not choice.lower().startswith("delete"):
-        return
-
-    nums_str = choice.lower().replace("delete", "").strip()
     try:
-        nums = [int(n.strip()) for n in nums_str.split(",") if n.strip().isdigit()]
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return {"success": True, "text": data["content"][0]["text"]}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        try:
+            msg = json.loads(body).get("error", {}).get("message", body)
+        except Exception:
+            msg = body
+        return {"success": False, "error": f"API Error: {msg}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def test_api_key(api_key):
+    return _call_claude(
+        messages=[{"role": "user", "content": "ping"}],
+        system="Reply with only: pong",
+        api_key=api_key,
+        max_tokens=5,
+    )
+
+
+def _needs_sudo(cmd):
+    sudo_cmds = ["apt", "apt-get", "systemctl", "service", "ufw", "iptables",
+                 "certbot", "useradd", "userdel", "usermod", "chmod", "chown",
+                 "mount", "umount", "reboot", "shutdown", "dpkg", "snap",
+                 "add-apt-repository", "mv", "rm", "cp", "mkdir", "tee",
+                 "sed", "ln", "touch"]
+    first_word = cmd.strip().split()[0] if cmd.strip() else ""
+    return first_word in sudo_cmds and not cmd.strip().startswith("sudo")
+
+
+def _apply_sudo(cmd):
+    if _needs_sudo(cmd):
+        return "sudo " + cmd
+    return cmd
+
+
+def _get_display_env():
+    """Get DISPLAY variable for GUI apps."""
+    import subprocess
+    env = {}
+    # Try to find active display
+    try:
+        result = subprocess.run("w -h | awk '{print $2}' | head -1", shell=True, capture_output=True, text=True)
+        tty = result.stdout.strip()
+        if tty:
+            result2 = subprocess.run(f"cat /proc/$(pgrep -t {tty} | head -1)/environ 2>/dev/null | tr '\0' '\n' | grep DISPLAY", shell=True, capture_output=True, text=True)
+            for line in result2.stdout.splitlines():
+                if line.startswith("DISPLAY="):
+                    env["DISPLAY"] = line.split("=", 1)[1]
     except Exception:
-        console.print("[red]Invalid format.[/]")
-        return
-
-    selected = [r for r in results if r["num"] in nums]
-    if not selected:
-        console.print("[dim]No items selected.[/]")
-        return
-
-    console.print()
-    console.print("[bold]Will be deleted:[/]")
-    total_size = 0
-    for item in selected:
-        risk = executor.risk_check(f"rm {'-rf' if item['is_dir'] else ''} {item['path']}")
-        color = risk_color(risk["level"])
-        console.print(f"  [{color}]{'🔴' if risk['level'] == 'red' else '🟡' if risk['level'] == 'yellow' else '🟢'}[/] {item['path']}  [dim]{item['size_fmt']}[/]")
-        total_size += item["size"]
-
-    console.print(f"\n[dim]Total: {executor.fmt_size(total_size)}[/]")
-    console.print()
-    console.print("[bold]Are you sure?[/]")
-    console.print("  [bright_green]Y[/]  → Delete")
-    console.print("  [red]N[/]  → Cancel")
-    console.print("  [cyan]B[/]  → Backup then delete")
-    console.print()
-
-    ans = Prompt.ask("Choice", choices=["Y", "y", "N", "n", "B", "b"], default="N")
-
-    if ans.upper() == "N":
-        console.print("[dim]Cancelled.[/]")
-        return
-
-    backup_dir = None
-    if ans.upper() == "B":
-        with Progress(SpinnerColumn(), TextColumn("[cyan]Backing up..."), transient=True) as p:
-            p.add_task("")
-            bk = backup.create_backup([r["path"] for r in selected], label=query)
-        if bk["success"]:
-            console.print(f"[bright_green]✓ Backup saved → {bk['backup_path']}[/]")
-            backup_dir = bk["backup_path"]
-        else:
-            console.print("[red]Backup failed! Delete cancelled.[/]")
-            return
-
-    console.print()
-    result = executor.delete_items(selected, backup_dir)
-
-    for path in result["success"]:
-        console.print(f"[bright_green]✓[/] {path}")
-    for fail in result["failed"]:
-        console.print(f"[red]✗[/] {fail['path']} — {fail['error']}")
-
-    if result["success"]:
-        console.print(f"\n[bright_green]✓ {len(result['success'])} items deleted.[/]")
-        if backup_dir:
-            console.print(f"[dim]To restore: spindle restore {Path(backup_dir).name}[/]")
+        pass
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+    return env
 
 
-def cmd_request(request: str, dry_run: bool = False, one_time_model: str = None):
-    """Send a natural language request to Claude AI."""
-    api_key = claude_api.get_api_key()
-    if not api_key:
-        console.print("[yellow]No API key found. Run: spindle login[/]")
-        return
-
-    # Test API key first
-    with Progress(SpinnerColumn(), TextColumn("[cyan]Connecting to AI..."), transient=True) as p:
-        p.add_task("")
-        test = claude_api.test_api_key(api_key)
-
-    if not test["success"]:
-        console.print(f"[red]API key error: {test['error']}[/]")
-        console.print("[dim]Run 'spindle login' to update your API key.[/]")
-        return
-
-    # Scan system
-    with Progress(SpinnerColumn(), TextColumn("[cyan]Scanning system..."), transient=True) as p:
-        p.add_task("")
-        sys_data = scanner.full_scan()
-
-    if one_time_model:
-        original_model = claude_api.load_config().get("model", "sonnet")
-        claude_api.set_model(one_time_model)
-    model_name = claude_api.get_model_display_name()
-    print(f"\033[36m⠿ Working on it... [{model_name}]\033[0m")
-    result = claude_api.ask_claude(request, system_context=sys_data, api_key=api_key)
-    if one_time_model:
-        claude_api.set_model(original_model)
-
-    if not result["success"]:
-        console.print(f"[red]Error: {result['error']}[/]")
-        return
-
-    console.print()
-
-    if result.get("command_ran"):
-        console.print(f"[dim]▸ Ran:[/] [yellow]{result['command_ran']}[/]")
-        console.print()
-
-    print_response_panel(result["response"], title=f"Spindle Response — {request[:50]}")
-
-    if dry_run:
-        console.print("[dim][DRY RUN — Nothing was executed][/]")
-
-    console.print()
+def _run_command(cmd):
+    try:
+        env = {**__import__("os").environ, **_get_display_env()}
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60, env=env)
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        return out if out else err
+    except subprocess.TimeoutExpired:
+        return "Command timed out after 60 seconds."
+    except Exception as e:
+        return str(e)
 
 
-def cmd_backup(action: str, target: str = ""):
-    if action in ("now", "create"):
-        paths = [target] if target else [str(Path.home())]
-        with Progress(SpinnerColumn(), TextColumn("[cyan]Backing up..."), transient=True) as p:
-            p.add_task("")
-            result = backup.create_backup(paths, label=target or "manual")
+def _run_command_live(cmd):
+    import sys, time, threading
+    print()
+    process = subprocess.Popen(
+        cmd, shell=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    output_lines = []
+    last_output_time = [time.time()]
+    stop_waiting = threading.Event()
 
-        if result["success"]:
-            console.print(f"[bright_green]✓ Backup saved → {result['backup_path']}[/]")
-        else:
-            console.print("[red]Backup failed.[/]")
-    else:
-        console.print(f"[yellow]Unknown backup command: {action}[/]")
-
-
-def cmd_restore(name: str):
-    backups = backup.list_backups()
-    names = [b["name"] for b in backups]
-
-    if name not in names:
-        console.print(f"[red]Backup not found: {name}[/]")
-        console.print("[dim]Available backups: spindle ls backups[/]")
-        return
-
-    if not Confirm.ask(f"Restore backup '{name}'?"):
-        return
-
-    with Progress(SpinnerColumn(), TextColumn("[cyan]Restoring..."), transient=True) as p:
-        p.add_task("")
-        result = backup.restore_backup(name)
-
-    if result["success"]:
-        for r in result["restored"]:
-            console.print(f"[bright_green]✓[/] {r}")
-        console.print(f"\n[bright_green]✓ Restore complete.[/]")
-    else:
-        console.print(f"[red]Error: {result.get('error', 'Unknown error')}[/]")
-
-
-def cmd_login():
-    console.print()
-    console.print(Panel(
-        "[bold]Claude API Key Setup[/]\n\n"
-        "Get your API key at:\n"
-        "  [cyan]https://console.anthropic.com[/]\n\n"
-        "[dim]Key is saved to ~/.spindle/config.json[/]",
-        border_style="cyan"
-    ))
-    console.print()
-
-    key = getpass.getpass("API Key (sk-ant-...): ")
-    if not key.startswith("sk-"):
-        console.print("[yellow]Warning: Unusual format, but saving anyway.[/]")
-
-    # Test the key
-    console.print("[dim]Testing API key...[/]")
-    test = claude_api.test_api_key(key.strip())
-    if test["success"]:
-        claude_api.set_api_key(key.strip())
-        console.print("[bright_green]✓ API key is valid and saved.[/]")
-    else:
-        console.print(f"[red]API key test failed: {test['error']}[/]")
-        console.print("[yellow]Key not saved. Please check and try again.[/]")
-    console.print()
-
-
-def cmd_config(args):
-    """Show or change configuration."""
-    from core.claude_api import get_model, set_model, MODELS, get_api_key
-
-    if not args:
-        # Show current config
-        model = get_model()
-        api_key = get_api_key()
-        console.print()
-        console.print(Panel(
-            f"[bold]Current Configuration[/]\n\n"
-            f"[dim]Model:[/]    [cyan]{model['name']}[/]\n"
-            f"[dim]API Key:[/]  [green]{'✓ Set' if api_key else '✗ Not set'}[/]\n",
-            border_style="cyan", title="spindle config"
-        ))
-        console.print("[dim]Available models:[/]")
-        for key, m in MODELS.items():
-            marker = " ← current" if m["id"] == model["id"] else ""
-            console.print(f"  [yellow]{key}[/]  {m['name']}{marker}")
-        console.print()
-        console.print("[dim]Usage: spindle config --model sonnet|opus|haiku[/]")
-        console.print()
-        return
-
-    if "--model" in args:
-        idx = args.index("--model")
-        if idx + 1 < len(args):
-            model_key = args[idx + 1].lower()
-            if set_model(model_key):
-                model = get_model()
-                console.print(f"[bright_green]✓ Model changed to: {model['name']}[/]")
-            else:
-                console.print(f"[red]Unknown model: {model_key}[/]")
-                console.print("[dim]Available: sonnet, opus, haiku[/]")
-        else:
-            console.print("[red]Usage: spindle config --model sonnet|opus|haiku[/]")
-
-    elif "--show" in args:
-        cmd_config([])
-
-
-def cmd_info():
-    width = console.size.width
-    console.print()
-    if width < 90:
-        console.print("[bold cyan]Spindle™[/]")
-        console.print()
-        console.print("[dim]Developed and maintained by[/] [bold]Petacomm[/]")
-        console.print("[dim]Copyright (c) 2026 Kuzey ÖZDEMİR (Petacomm)[/]")
-        console.print()
-        console.print("[dim]GNU GPL v3 License.[/]")
-        console.print("[dim]github.com/petacomm/spindle[/]")
-    else:
-        console.print(Panel(
-            "[bold cyan]Spindle™[/]\n\n"
-            "[dim]Developed and maintained by[/] [bold]Petacomm[/]\n"
-            "[dim]Copyright (c) 2026 Kuzey ÖZDEMİR (Petacomm)[/]\n\n"
-            "[dim]Released under the GNU GPL v3 License.[/]\n\n"
-            "[dim]https://github.com/petacomm/spindle[/]",
-            border_style="cyan", padding=(1, 2), width=min(width - 4, 70)
-        ))
-    console.print()
-
-
-def cmd_help():
-    console.print()
-    console.print(Panel(
-        "[bold cyan]Spindle[/] — Linux Management Tool\n\n"
-        "[bold]Commands:[/]\n"
-        "  [yellow]spindle status[/]                   System status\n"
-        "  [yellow]spindle health[/]                   Health score\n"
-        "  [yellow]spindle ls services[/]              List services\n"
-        "  [yellow]spindle ls ports[/]                 List open ports\n"
-        "  [yellow]spindle ls backups[/]               List backups\n"
-        "  [yellow]spindle ls processes[/]             List processes\n"
-        "  [yellow]spindle logs nginx[/]               Show nginx logs\n"
-        "  [yellow]spindle logs nginx --follow[/]      Live log stream\n"
-        "  [yellow]spindle find \"keyword\"[/]           Find and delete files\n"
-        "  [yellow]spindle backup now[/]               Take backup now\n"
-        "  [yellow]spindle restore <name>[/]           Restore a backup\n"
-        "  [yellow]spindle -r \"your request\"[/]        Ask AI (Claude)\n"
-        "  [yellow]spindle -r -m \"your request\"[/]     Ask AI and configure model for one time (Claude)\n"
-        "  [yellow]spindle --dry-run -r \"..\"[/]        Simulate, don't run\n"
-        "  [yellow]spindle login[/]                    Set API key\n"
-        "  [yellow]spindle help[/]                     This help\n"
-        "  [yellow]spindle clear[/]                    Clear conservation memory\n"
-        "  [yellow]spindle config[/]                   Monitor available models\n"
-        "  [yellow]spindle config --model modelname[/] Configure LLM model (ex: spindle config --model haiku)\n",
-        border_style="cyan", padding=(1, 2)
-    ))
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
-
-def main():
-    args = sys.argv[1:]
-
-    if not args:
-        cmd_help()
-        return
-
-    dry_run = "--dry-run" in args
-    args = [a for a in args if a != "--dry-run"]
-
-    cmd = args[0]
-
-    if cmd == "-r":
-        remaining = args[1:]
-        # Check for one-time model override
-        one_time_model = None
-        model_flags = {
-            "-opus": "opus", "-o": "opus",
-            "-sonnet": "sonnet", "-s": "sonnet",
-            "-haiku": "haiku", "-h": "haiku",
-        }
-        for flag, model_key in model_flags.items():
-            if remaining and remaining[0] == flag:
-                one_time_model = model_key
-                remaining = remaining[1:]
+    def show_waiting_dots():
+        dot_count = 0
+        while not stop_waiting.is_set():
+            time.sleep(1.5)
+            if stop_waiting.is_set():
                 break
-        request = " ".join(remaining)
-        if not request:
-            console.print("[red]Error: Empty request.[/]")
-            console.print("[dim]Example: spindle -r \"why is nginx not running\"[/]")
-            return
-        cmd_request(request, dry_run=dry_run, one_time_model=one_time_model)
+            elapsed = time.time() - last_output_time[0]
+            if elapsed > 2:
+                dot_count = (dot_count % 3) + 1
+                sys.stdout.write(f"\r  Still running{'.' * dot_count}{' ' * (3 - dot_count)}  ")
+                sys.stdout.flush()
 
-    elif cmd == "status":
-        cmd_status()
+    waiter = threading.Thread(target=show_waiting_dots, daemon=True)
+    waiter.start()
 
-    elif cmd == "health":
-        cmd_health()
+    for line in process.stdout:
+        last_output_time[0] = time.time()
+        sys.stdout.write("\r" + " " * 30 + "\r")
+        print(f"  {line}", end="", flush=True)
+        output_lines.append(line)
 
-    elif cmd == "ls":
-        target = args[1] if len(args) > 1 else ""
-        if not target:
-            console.print("[yellow]What to list?[/]")
-            console.print("[dim]Example: spindle ls services[/]")
+    process.wait()
+    stop_waiting.set()
+    sys.stdout.write("\r" + " " * 30 + "\r")
+    print()
+    return "".join(output_lines)
+
+
+def _run_parallel(tasks):
+    import sys
+    results = {}
+    status = {t["name"]: "pending" for t in tasks}
+    lock = threading.Lock()
+
+    COLORS = {"pending": "\033[90m", "running": "\033[36m", "done": "\033[32m", "error": "\033[31m"}
+    ICONS = {"pending": "○", "running": "⠋", "done": "✓", "error": "✗"}
+    SPIN = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+    NC = "\033[0m"
+    n = len(tasks)
+
+    def draw(spin_frame=0):
+        sys.stdout.write(f"\033[{n}A\033[J")
+        for t in tasks:
+            s = status[t["name"]]
+            color = COLORS[s]
+            icon = SPIN[spin_frame % len(SPIN)] if s == "running" else ICONS[s]
+            sys.stdout.write(f"  {color}{icon} {t['name']}{NC}\n")
+        sys.stdout.flush()
+
+    for t in tasks:
+        sys.stdout.write(f"  \033[90m○ {t['name']}\033[0m\n")
+    sys.stdout.flush()
+
+    def run_task(task):
+        name = task["name"]
+        cmd = "sudo " + task["cmd"] if not task["cmd"].strip().startswith("sudo") else task["cmd"]
+        with lock:
+            status[name] = "running"
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+            out = result.stdout.strip() or result.stderr.strip()
+            with lock:
+                status[name] = "done" if result.returncode == 0 else "error"
+            results[name] = {"success": result.returncode == 0, "output": out}
+        except Exception as e:
+            with lock:
+                status[name] = "error"
+            results[name] = {"success": False, "output": str(e)}
+
+    threads = []
+    for task in tasks:
+        t = threading.Thread(target=run_task, args=(task,))
+        t.start()
+        threads.append(t)
+
+    frame = 0
+    while any(t.is_alive() for t in threads):
+        time.sleep(0.1)
+        with lock:
+            draw(frame)
+        frame += 1
+    with lock:
+        draw(frame)
+    print()
+    return results
+
+
+def _get_cwd_context():
+    """Get current working directory and its contents for fast file lookups."""
+    import subprocess
+    try:
+        pwd = subprocess.run("pwd", shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        ls = subprocess.run("ls -la", shell=True, capture_output=True, text=True, timeout=5).stdout.strip()
+        return f"\nCurrent directory: {pwd}\nFiles in current directory:\n{ls}\n"
+    except Exception:
+        return ""
+
+
+def _build_context(system_context):
+    if not system_context:
+        return ""
+    ram = system_context.get("ram", {})
+    services = system_context.get("services", [])
+    health = system_context.get("health", {})
+    disks = system_context.get("disks", [])
+    disk_info = ""
+    for d in disks[:5]:
+        disk_info += f"\n  - {d['mount']}: {d['percent']}% used"
+    return f"""
+Current system state:
+- Hostname: {system_context.get('hostname', '?')}
+- OS: {system_context.get('os', '?')}
+- Kernel: {system_context.get('kernel', '?')}
+- IP: {system_context.get('ip', '?')}
+- Uptime: {system_context.get('uptime', '?')}
+- CPU usage: {system_context.get('cpu', '?')}%
+- RAM: {ram.get('percent', '?')}% ({ram.get('used', 0) // 1024 // 1024}MB of {ram.get('total', 0) // 1024 // 1024}MB)
+- Disks:{disk_info}
+- Running services: {', '.join(s['name'] for s in services if s.get('active')) or 'none'}
+- Failed services: {', '.join(s['name'] for s in services if s.get('status') == 'failed') or 'none'}
+- Health score: {health.get('score', '?')}
+- Warnings: {', '.join(health.get('warnings', [])) or 'none'}
+- Critical issues: {', '.join(health.get('criticals', [])) or 'none'}
+"""
+
+
+def _detect_language(text, api_key):
+    result = _call_claude(
+        messages=[{"role": "user", "content": f"What language is this text written in? Reply with only the language name in English. Text: {text}"}],
+        system="You are a language detector. Reply with only the language name in English (e.g. Turkish, English, German). Nothing else.",
+        api_key=api_key,
+        max_tokens=10,
+    )
+    return result.get("text", "English").strip()
+
+
+def _confirmation_words(language):
+    words = {
+        "Turkish": {"yes": ["evet", "e", "tamam", "ok"], "no": ["hayir", "hayır", "h", "iptal"], "prompt": "Onaylıyor musunuz? (Evet/Hayır)"},
+        "English": {"yes": ["yes", "y", "ok", "sure"], "no": ["no", "n", "cancel"], "prompt": "Do you confirm? (Yes/No)"},
+        "German":  {"yes": ["ja", "j", "ok"], "no": ["nein", "n"], "prompt": "Bestätigen Sie? (Ja/Nein)"},
+        "French":  {"yes": ["oui", "o", "ok"], "no": ["non", "n"], "prompt": "Confirmez-vous? (Oui/Non)"},
+        "Spanish": {"yes": ["si", "sí", "s", "ok"], "no": ["no", "n"], "prompt": "¿Confirma? (Sí/No)"},
+    }
+    return words.get(language, words["English"])
+
+
+def clean_response(text):
+    text = re.sub(r'SPINDLE_RUN:.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'SPINDLE_CONFIRM:.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'SPINDLE_PARALLEL:.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<invoke.*?</invoke>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<parameter.*?</parameter>', '', text, flags=re.DOTALL)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\*{1,3}([^*\n]+)\*{1,3}', r'\1', text)
+    text = re.sub(r'_{1,3}([^_\n]+)_{1,3}', r'\1', text)
+    text = re.sub(r'```[a-z]*\n?', '', text)
+    text = re.sub(r'```', '', text)
+    text = re.sub(r'`([^`\n]+)`', r'\1', text)
+    text = re.sub(r'^[-*_]{3,}\s*$', '─' * 40, text, flags=re.MULTILINE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def ask_claude(request, system_context=None, api_key=None):
+    key = api_key or get_api_key()
+    if not key:
+        return {"success": False, "error": "API key not found. Run: spindle login", "response": None}
+
+    model = get_model()
+    context_str = _build_context(system_context) + _get_cwd_context()
+    language = _detect_language(request, key)
+    history = load_history()
+    history_messages = _history_to_messages(history)
+
+    turn1_system = f"""You are Spindle, an AI-powered Linux management assistant, developed under Petacomm. If asked who's behind it, you can mention Petacomm is the name the developer uses for independent projects like this one.
+The user language is: {language}. You MUST respond in {language}. NON-NEGOTIABLE.
+Never switch to English or any other language. Even errors, warnings, technical terms — always in {language}.
+
+{context_str}
+
+You have memory of recent conversation. If the user refers to something from before (like choosing option A/B/C, or "do it", "yes the second one"), use the conversation history to understand what they mean.
+
+    RULES:
+    1. Always respond in {language}. Never switch languages.
+    
+    2. To run ANY command (including launching apps like pycharm, firefox, petamonitor), put ONLY this on the very last line:
+       SPINDLE_RUN: <full shell command>
+       Chain multiple commands with &&. NEVER write anything after this line.
+       NEVER use function_calls, invoke, or any XML tool format. ONLY use SPINDLE_RUN.
+       To launch an app, just write its name: SPINDLE_RUN: petamonitor
+       For GUI apps use setsid: SPINDLE_RUN: DISPLAY=:0 setsid firefox &>/dev/null
+       For snap GUI apps (pycharm, etc.) use full path: SPINDLE_RUN: DISPLAY=:0 setsid /snap/bin/pycharm &>/dev/null
+       When unsure if app is snap, use: DISPLAY=:0 setsid bash -c '<app> || /snap/bin/<app>' &>/dev/null
+       Figure out the app name from what the user says (e.g. "firefox'u aç" -> firefox, "pycharm aç" -> pycharm).
+    
+    3. For MULTIPLE INDEPENDENT modifying tasks that can run in PARALLEL (e.g. install nginx AND mysql AND redis):
+       Explain what will happen, then end with EXACTLY this on the last line:
+       SPINDLE_PARALLEL: [{{"name":"nginx","cmd":"apt install -y nginx"}},{{"name":"mysql","cmd":"apt install -y mysql-server"}}]
+    
+    4. For a SINGLE modifying operation:
+       Explain what will happen, list risks, then end with EXACTLY this on the last line:
+       SPINDLE_CONFIRM: <exact command> | DANGER: low|medium|high
+       THIS IS MANDATORY for any modifying operation. Never skip it.
+    
+    5. If no command needed, answer directly in {language}.
+    6. Explain like talking to a complete beginner. Use simple analogies.
+    7. If a previous command failed, remember it and suggest fixing the root cause.
+    8. Before saying an application is not installed, always check with: which <app> || find /snap/bin /opt /usr/local/bin -name "<app>*" 2>/dev/null
+    9. For GUI applications: first try wmctrl -a '<AppName>' to bring existing window to front. If not open, launch with: DISPLAY=:0 nohup /snap/bin/<app> &>/dev/null & then wmctrl -a '<AppName>'
+    10. When the user mentions a filename, you already have the current directory and its file listing above. If the file is there, act on it directly in ONE command (no need to ls separately).
+        If the file is NOT in the current directory listing, find it first then act on it, all in ONE chained command. Example:
+        PETACOMM_RUN: f=$(find ~ -iname "abc.zip" 2>/dev/null | head -1) && cd "$(dirname "$f")" && unzip "$f"
+        Always do this in a single command chain — never ask the user to confirm the search step separately.
+    
+    11. For .run installer files (e.g. NVIDIA drivers, game installers): these execute arbitrary code with elevated effect, so treat them as a MODIFYING operation requiring PETACOMM_CONFIRM.
+        The command should be: chmod +x <path>.run && sudo <path>.run
+        If the file is not in the current directory, find it first then build the chmod+run chain together, same as rule 10.
+        Always mark these as DANGER: medium or high depending on what the installer claims to do (driver install = medium, unknown installer = high)."""
+
+    messages = history_messages + [{"role": "user", "content": request}]
+
+    turn1 = _call_claude(
+        messages=messages,
+        system=turn1_system,
+        api_key=key,
+        max_tokens=768,
+        model_id=model["id"],
+    )
+
+    if not turn1["success"]:
+        return {"success": False, "error": turn1["error"], "response": None}
+
+    turn1_text = turn1["text"].strip()
+    turn1_text = re.sub(r'Onaylıyor musunuz.*$', '', turn1_text, flags=re.IGNORECASE|re.DOTALL).strip()
+    turn1_text = re.sub(r'Do you confirm.*$', '', turn1_text, flags=re.IGNORECASE|re.DOTALL).strip()
+
+    command_ran = None
+    command_output = None
+
+    run_match = re.search(r'SPINDLE_RUN:\s*(.+?)$', turn1_text, re.MULTILINE)
+    confirm_match = re.search(r'SPINDLE_CONFIRM:\s*(.+?)\s*\|\s*DANGER:\s*(low|medium|high)', turn1_text, re.IGNORECASE)
+    parallel_match = re.search(r'SPINDLE_PARALLEL:\s*(\[.+?\])\s*$', turn1_text, re.MULTILINE | re.DOTALL)
+
+    if run_match:
+        command_ran = run_match.group(1).strip()
+        command_output = _run_command(command_ran)
+
+    elif parallel_match:
+        try:
+            tasks_raw = json.loads(parallel_match.group(1))
+        except Exception:
+            tasks_raw = []
+
+        if tasks_raw:
+            explanation = clean_response(turn1_text[:parallel_match.start()].strip())
+            conf_words = _confirmation_words(language)
+
+            print()
+            print("─" * 60)
+            if explanation:
+                print(explanation)
+                print()
+            label = f"  📦 {len(tasks_raw)} işlem paralel çalışacak:" if language == "Turkish" else f"  📦 {len(tasks_raw)} tasks will run in parallel:"
+            print(label)
+            for t in tasks_raw:
+                print(f"     • {t['name']}")
+            print()
+            print(f"⚠️  {conf_words['prompt']} ", end="", flush=True)
+
+            try:
+                answer = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return {"success": True, "response": "Cancelled.", "command_ran": None, "command_output": None, "error": None}
+
+            if answer in conf_words["yes"]:
+                print()
+                parallel_results = _run_parallel(tasks_raw)
+                command_ran = " && ".join(t["cmd"] for t in tasks_raw)
+                command_output = "\n".join(
+                    f"[{t['name']}]: {'SUCCESS' if parallel_results.get(t['name'], {}).get('success') else 'FAILED'}\n{parallel_results.get(t['name'], {}).get('output', '')}"
+                    for t in tasks_raw
+                )
+            else:
+                cancelled = {"Turkish": "İptal edildi.", "English": "Cancelled."}
+                resp = cancelled.get(language, "Cancelled.")
+                save_history_turn(request, resp)
+                return {"success": True, "response": resp, "command_ran": None, "command_output": None, "error": None}
+
+    elif confirm_match:
+        confirm_cmd = confirm_match.group(1).strip()
+        danger = confirm_match.group(2).strip()
+        explanation = clean_response(turn1_text[:confirm_match.start()].strip())
+        conf_words = _confirmation_words(language)
+        danger_icon = {"low": "⚠️", "medium": "⚠️", "high": "🔴"}.get(danger, "⚠️")
+
+        print()
+        print("─" * 60)
+        if explanation:
+            print(explanation)
+            print()
+        print(f"{danger_icon} {conf_words['prompt']} ", end="", flush=True)
+
+        try:
+            answer = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return {"success": True, "response": "Cancelled.", "command_ran": None, "command_output": None, "error": None}
+
+        if answer in conf_words["yes"]:
+            confirm_cmd = _apply_sudo(confirm_cmd)
+            command_ran = confirm_cmd
+            command_output = _run_command_live(command_ran)
         else:
-            cmd_ls(target)
+            cancelled = {"Turkish": "İptal edildi.", "English": "Cancelled.", "German": "Abgebrochen.", "French": "Annulé.", "Spanish": "Cancelado."}
+            resp = cancelled.get(language, "Cancelled.")
+            save_history_turn(request, resp)
+            return {"success": True, "response": resp, "command_ran": None, "command_output": None, "error": None}
 
-    elif cmd == "logs":
-        target = args[1] if len(args) > 1 else "system"
-        follow = "--follow" in args or "-f" in args
-        cmd_logs(target, follow=follow)
+    if command_output is not None:
+        turn2_system = f"""You are Spindle, an AI-powered Linux management assistant, developed under Petacomm.
+The user language is: {language}. You MUST respond in {language}. NON-NEGOTIABLE.
+Never switch to English or any other language.
 
-    elif cmd == "find":
-        query = " ".join(args[1:])
-        if not query:
-            console.print("[red]Error: Search term required.[/]")
-            console.print("[dim]Example: spindle find \"gatebell\"[/]")
-        else:
-            cmd_find(query)
+{context_str}
 
-    elif cmd == "backup":
-        action = args[1] if len(args) > 1 else "now"
-        target = args[2] if len(args) > 2 else ""
-        cmd_backup(action, target)
+You just ran: {command_ran}
+Raw output:
+---
+{command_output}
+---
 
-    elif cmd == "restore":
-        name = args[1] if len(args) > 1 else ""
-        if not name:
-            console.print("[red]Error: Backup name required.[/]")
-            console.print("[dim]Example: spindle restore 2026-04-17_09-22-00[/]")
-        else:
-            cmd_restore(name)
+RULES:
+1. Respond ONLY in {language}. Never use English.
+2. Explain as if talking to a complete beginner who never used Linux.
+3. Replace ALL technical terms with simple analogies.
+4. Use ✅ for good, ⚠️ for warning, ❌ for problem.
+5. Show sizes in human readable format (GB, MB).
+6. If there is a problem, give simple next steps.
+7. No markdown — no ##, no **, no backticks. Plain text only."""
 
-    elif cmd == "clear":
-        claude_api.clear_history()
-        console.print("[bright_green]✓ Conversation cleared.[/]")
+        msg2 = [
+            {"role": "user", "content": request},
+            {"role": "assistant", "content": turn1_text},
+            {"role": "user", "content": f"Command output:\n{command_output}"},
+        ]
+        turn2 = _call_claude(messages=msg2, system=turn2_system, api_key=key, max_tokens=1024, model_id=model["id"])
 
-    elif cmd == "login":
-        cmd_login()
+        if not turn2["success"]:
+            return {"success": False, "error": turn2["error"], "response": None}
 
-    elif cmd == "info":
-        cmd_info()
+        final_resp = clean_response(turn2["text"])
+        save_history_turn(request, final_resp, command_ran, command_output)
+        return {"success": True, "response": final_resp, "command_ran": command_ran, "command_output": command_output, "error": None, "model": model["name"]}
 
-    elif cmd == "config":
-        cmd_config(args[1:] if len(args) > 1 else [])
-
-    elif cmd in ("help", "--help", "-h"):
-        cmd_help()
-
-    else:
-        console.print(f"[yellow]Unknown command: {cmd}[/]")
-        console.print("[dim]For help: spindle help[/]")
-
-
-if __name__ == "__main__":
-    main()
+    final_resp = clean_response(turn1_text)
+    save_history_turn(request, final_resp)
+    return {"success": True, "response": final_resp, "command_ran": None, "command_output": None, "error": None, "model": model["name"]}
